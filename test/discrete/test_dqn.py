@@ -6,15 +6,11 @@ import argparse
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.env import VectorEnv
 from tianshou.policy import DQNPolicy
+from tianshou.env import DummyVectorEnv
+from tianshou.utils.net.common import Net
 from tianshou.trainer import offpolicy_trainer
-from tianshou.data import Collector, ReplayBuffer
-
-if __name__ == '__main__':
-    from net import Net
-else:  # pytest
-    from test.discrete.net import Net
+from tianshou.data import Collector, ReplayBuffer, PrioritizedReplayBuffer
 
 
 def get_args():
@@ -37,6 +33,9 @@ def get_args():
     parser.add_argument('--test-num', type=int, default=100)
     parser.add_argument('--logdir', type=str, default='log')
     parser.add_argument('--render', type=float, default=0.)
+    parser.add_argument('--prioritized-replay', type=int, default=0)
+    parser.add_argument('--alpha', type=float, default=0.6)
+    parser.add_argument('--beta', type=float, default=0.4)
     parser.add_argument(
         '--device', type=str,
         default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -50,10 +49,10 @@ def test_dqn(args=get_args()):
     args.action_shape = env.action_space.shape or env.action_space.n
     # train_envs = gym.make(args.task)
     # you can also use tianshou.env.SubprocVectorEnv
-    train_envs = VectorEnv(
+    train_envs = DummyVectorEnv(
         [lambda: gym.make(args.task) for _ in range(args.training_num)])
     # test_envs = gym.make(args.task)
-    test_envs = VectorEnv(
+    test_envs = DummyVectorEnv(
         [lambda: gym.make(args.task) for _ in range(args.test_num)])
     # seed
     np.random.seed(args.seed)
@@ -61,16 +60,21 @@ def test_dqn(args=get_args()):
     train_envs.seed(args.seed)
     test_envs.seed(args.seed)
     # model
-    net = Net(args.layer_num, args.state_shape, args.action_shape, args.device)
-    net = net.to(args.device)
+    net = Net(args.layer_num, args.state_shape,
+              args.action_shape, args.device,  # dueling=(1, 1)
+              ).to(args.device)
     optim = torch.optim.Adam(net.parameters(), lr=args.lr)
     policy = DQNPolicy(
         net, optim, args.gamma, args.n_step,
-        use_target_network=args.target_update_freq > 0,
         target_update_freq=args.target_update_freq)
+    # buffer
+    if args.prioritized_replay > 0:
+        buf = PrioritizedReplayBuffer(
+            args.buffer_size, alpha=args.alpha, beta=args.beta)
+    else:
+        buf = ReplayBuffer(args.buffer_size)
     # collector
-    train_collector = Collector(
-        policy, train_envs, ReplayBuffer(args.buffer_size))
+    train_collector = Collector(policy, train_envs, buf)
     test_collector = Collector(policy, test_envs)
     # policy.set_eps(1)
     train_collector.collect(n_step=args.batch_size)
@@ -81,13 +85,21 @@ def test_dqn(args=get_args()):
     def save_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
 
-    def stop_fn(x):
-        return x >= env.spec.reward_threshold
+    def stop_fn(mean_rewards):
+        return mean_rewards >= env.spec.reward_threshold
 
-    def train_fn(x):
-        policy.set_eps(args.eps_train)
+    def train_fn(epoch, env_step):
+        # eps annnealing, just a demo
+        if env_step <= 10000:
+            policy.set_eps(args.eps_train)
+        elif env_step <= 50000:
+            eps = args.eps_train - (env_step - 10000) / \
+                40000 * (0.9 * args.eps_train)
+            policy.set_eps(eps)
+        else:
+            policy.set_eps(0.1 * args.eps_train)
 
-    def test_fn(x):
+    def test_fn(epoch, env_step):
         policy.set_eps(args.eps_test)
 
     # trainer
@@ -98,16 +110,21 @@ def test_dqn(args=get_args()):
         stop_fn=stop_fn, save_fn=save_fn, writer=writer)
 
     assert stop_fn(result['best_reward'])
-    train_collector.close()
-    test_collector.close()
     if __name__ == '__main__':
         pprint.pprint(result)
         # Let's watch its performance!
         env = gym.make(args.task)
+        policy.eval()
+        policy.set_eps(args.eps_test)
         collector = Collector(policy, env)
         result = collector.collect(n_episode=1, render=args.render)
         print(f'Final reward: {result["rew"]}, length: {result["len"]}')
-        collector.close()
+
+
+def test_pdqn(args=get_args()):
+    args.prioritized_replay = 1
+    args.gamma = .95
+    test_dqn(args)
 
 
 if __name__ == '__main__':

@@ -5,6 +5,7 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, 'ci skip')"
     strategy:
       matrix:
         python-version: [3.6, 3.7, 3.8]
@@ -25,10 +26,11 @@ jobs:
         python -m pip install --upgrade pip setuptools wheel
     - name: Install dependencies
       run: |
-        pip install ".[dev]" --upgrade
+        python -m pip install ".[dev]" --upgrade
     - name: Test with pytest
+      # ignore test/throughput which only profiles the code
       run: |
-        pytest test --cov tianshou --cov-report=xml --durations 0 -v
+        pytest test --ignore-glob='*profile.py' --cov=tianshou --cov-report=xml --durations=0 -v
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v1
       with:

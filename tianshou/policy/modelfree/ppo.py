@@ -1,24 +1,25 @@
 import torch
 import numpy as np
 from torch import nn
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Any, Dict, List, Tuple, Union, Optional, Callable
 
 from tianshou.policy import PGPolicy
 from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch_as
 
 
 class PPOPolicy(PGPolicy):
-    r"""Implementation of Proximal Policy Optimization. arXiv:1707.06347
+    r"""Implementation of Proximal Policy Optimization. arXiv:1707.06347.
 
     :param torch.nn.Module actor: the actor network following the rules in
         :class:`~tianshou.policy.BasePolicy`. (s -> logits)
     :param torch.nn.Module critic: the critic network. (s -> V(s))
     :param torch.optim.Optimizer optim: the optimizer for actor and critic
         network.
-    :param torch.distributions.Distribution dist_fn: for computing the action.
+    :param dist_fn: distribution class for computing the action.
+    :type dist_fn: Callable[[], torch.distributions.Distribution]
     :param float discount_factor: in [0, 1], defaults to 0.99.
     :param float max_grad_norm: clipping gradients in back propagation,
-        defaults to ``None``.
+        defaults to None.
     :param float eps_clip: :math:`\epsilon` in :math:`L_{CLIP}` in the original
         paper, defaults to 0.2.
     :param float vf_coef: weight for value loss, defaults to 0.5.
@@ -31,9 +32,13 @@ class PPOPolicy(PGPolicy):
         where c > 1 is a constant indicating the lower bound,
         defaults to 5.0 (set ``None`` if you do not want to use it).
     :param bool value_clip: a parameter mentioned in arXiv:1811.02553 Sec. 4.1,
-        defaults to ``True``.
+        defaults to True.
     :param bool reward_normalization: normalize the returns to Normal(0, 1),
-        defaults to ``True``.
+        defaults to True.
+    :param int max_batchsize: the maximum size of the batch when computing GAE,
+        depends on the size of available memory and the memory cost of the
+        model; should be as large as possible within the memory constraint;
+        defaults to 256.
 
     .. seealso::
 
@@ -41,23 +46,26 @@ class PPOPolicy(PGPolicy):
         explanation.
     """
 
-    def __init__(self,
-                 actor: torch.nn.Module,
-                 critic: torch.nn.Module,
-                 optim: torch.optim.Optimizer,
-                 dist_fn: torch.distributions.Distribution,
-                 discount_factor: float = 0.99,
-                 max_grad_norm: Optional[float] = None,
-                 eps_clip: float = .2,
-                 vf_coef: float = .5,
-                 ent_coef: float = .01,
-                 action_range: Optional[Tuple[float, float]] = None,
-                 gae_lambda: float = 0.95,
-                 dual_clip: Optional[float] = None,
-                 value_clip: bool = True,
-                 reward_normalization: bool = True,
-                 **kwargs) -> None:
-        super().__init__(None, None, dist_fn, discount_factor, **kwargs)
+    def __init__(
+        self,
+        actor: torch.nn.Module,
+        critic: torch.nn.Module,
+        optim: torch.optim.Optimizer,
+        dist_fn: Callable[[], torch.distributions.Distribution],
+        discount_factor: float = 0.99,
+        max_grad_norm: Optional[float] = None,
+        eps_clip: float = 0.2,
+        vf_coef: float = 0.5,
+        ent_coef: float = 0.01,
+        action_range: Optional[Tuple[float, float]] = None,
+        gae_lambda: float = 0.95,
+        dual_clip: Optional[float] = None,
+        value_clip: bool = True,
+        reward_normalization: bool = True,
+        max_batchsize: int = 256,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(None, optim, dist_fn, discount_factor, **kwargs)
         self._max_grad_norm = max_grad_norm
         self._eps_clip = eps_clip
         self._w_vf = vf_coef
@@ -65,36 +73,52 @@ class PPOPolicy(PGPolicy):
         self._range = action_range
         self.actor = actor
         self.critic = critic
-        self.optim = optim
-        self._batch = 64
-        assert 0 <= gae_lambda <= 1, 'GAE lambda should be in [0, 1].'
+        self._batch = max_batchsize
+        assert 0.0 <= gae_lambda <= 1.0, "GAE lambda should be in [0, 1]."
         self._lambda = gae_lambda
-        assert dual_clip is None or dual_clip > 1, \
-            'Dual-clip PPO parameter should greater than 1.'
+        assert (
+            dual_clip is None or dual_clip > 1.0
+        ), "Dual-clip PPO parameter should greater than 1.0."
         self._dual_clip = dual_clip
         self._value_clip = value_clip
         self._rew_norm = reward_normalization
 
-    def process_fn(self, batch: Batch, buffer: ReplayBuffer,
-                   indice: np.ndarray) -> Batch:
+    def process_fn(
+        self, batch: Batch, buffer: ReplayBuffer, indice: np.ndarray
+    ) -> Batch:
         if self._rew_norm:
             mean, std = batch.rew.mean(), batch.rew.std()
-            if not np.isclose(std, 0):
+            if not np.isclose(std, 0.0, 1e-2):
                 batch.rew = (batch.rew - mean) / std
-        if self._lambda in [0, 1]:
-            return self.compute_episodic_return(
-                batch, None, gamma=self._gamma, gae_lambda=self._lambda)
-        v_ = []
+        v, v_, old_log_prob = [], [], []
         with torch.no_grad():
-            for b in batch.split(self._batch, shuffle=False):
+            for b in batch.split(self._batch, shuffle=False, merge_last=True):
                 v_.append(self.critic(b.obs_next))
+                v.append(self.critic(b.obs))
+                old_log_prob.append(
+                    self(b).dist.log_prob(to_torch_as(b.act, v[0]))
+                )
         v_ = to_numpy(torch.cat(v_, dim=0))
-        return self.compute_episodic_return(
-            batch, v_, gamma=self._gamma, gae_lambda=self._lambda)
+        batch = self.compute_episodic_return(
+            batch, v_, gamma=self._gamma, gae_lambda=self._lambda,
+            rew_norm=self._rew_norm)
+        batch.v = torch.cat(v, dim=0).flatten()  # old value
+        batch.act = to_torch_as(batch.act, v[0])
+        batch.logp_old = torch.cat(old_log_prob, dim=0)
+        batch.returns = to_torch_as(batch.returns, v[0])
+        batch.adv = batch.returns - batch.v
+        if self._rew_norm:
+            mean, std = batch.adv.mean(), batch.adv.std()
+            if not np.isclose(std.item(), 0.0, 1e-2):
+                batch.adv = (batch.adv - mean) / std
+        return batch
 
-    def forward(self, batch: Batch,
-                state: Optional[Union[dict, Batch, np.ndarray]] = None,
-                **kwargs) -> Batch:
+    def forward(
+        self,
+        batch: Batch,
+        state: Optional[Union[dict, Batch, np.ndarray]] = None,
+        **kwargs: Any,
+    ) -> Batch:
         """Compute action over the given batch data.
 
         :return: A :class:`~tianshou.data.Batch` which has 4 keys:
@@ -113,48 +137,29 @@ class PPOPolicy(PGPolicy):
         if isinstance(logits, tuple):
             dist = self.dist_fn(*logits)
         else:
-            dist = self.dist_fn(logits)
+            dist = self.dist_fn(logits)  # type: ignore
         act = dist.sample()
         if self._range:
             act = act.clamp(self._range[0], self._range[1])
         return Batch(logits=logits, act=act, state=h, dist=dist)
 
-    def learn(self, batch: Batch, batch_size: int, repeat: int,
-              **kwargs) -> Dict[str, List[float]]:
-        self._batch = batch_size
+    def learn(  # type: ignore
+        self, batch: Batch, batch_size: int, repeat: int, **kwargs: Any
+    ) -> Dict[str, List[float]]:
         losses, clip_losses, vf_losses, ent_losses = [], [], [], []
-        v = []
-        old_log_prob = []
-        with torch.no_grad():
-            for b in batch.split(batch_size, shuffle=False):
-                v.append(self.critic(b.obs))
-                old_log_prob.append(self(b).dist.log_prob(
-                    to_torch_as(b.act, v[0])))
-        batch.v = torch.cat(v, dim=0)  # old value
-        batch.act = to_torch_as(batch.act, v[0])
-        batch.logp_old = torch.cat(old_log_prob, dim=0)
-        batch.returns = to_torch_as(
-            batch.returns, v[0]).reshape(batch.v.shape)
-        if self._rew_norm:
-            mean, std = batch.returns.mean(), batch.returns.std()
-            if not np.isclose(std.item(), 0):
-                batch.returns = (batch.returns - mean) / std
-        batch.adv = batch.returns - batch.v
-        if self._rew_norm:
-            mean, std = batch.adv.mean(), batch.adv.std()
-            if not np.isclose(std.item(), 0):
-                batch.adv = (batch.adv - mean) / std
         for _ in range(repeat):
-            for b in batch.split(batch_size):
+            for b in batch.split(batch_size, merge_last=True):
                 dist = self(b).dist
-                value = self.critic(b.obs)
+                value = self.critic(b.obs).flatten()
                 ratio = (dist.log_prob(b.act) - b.logp_old).exp().float()
+                ratio = ratio.reshape(ratio.size(0), -1).transpose(0, 1)
                 surr1 = ratio * b.adv
-                surr2 = ratio.clamp(
-                    1. - self._eps_clip, 1. + self._eps_clip) * b.adv
+                surr2 = ratio.clamp(1.0 - self._eps_clip,
+                                    1.0 + self._eps_clip) * b.adv
                 if self._dual_clip:
-                    clip_loss = -torch.max(torch.min(surr1, surr2),
-                                           self._dual_clip * b.adv).mean()
+                    clip_loss = -torch.max(
+                        torch.min(surr1, surr2), self._dual_clip * b.adv
+                    ).mean()
                 else:
                     clip_loss = -torch.min(surr1, surr2).mean()
                 clip_losses.append(clip_loss.item())
@@ -163,9 +168,9 @@ class PPOPolicy(PGPolicy):
                         -self._eps_clip, self._eps_clip)
                     vf1 = (b.returns - value).pow(2)
                     vf2 = (b.returns - v_clip).pow(2)
-                    vf_loss = .5 * torch.max(vf1, vf2).mean()
+                    vf_loss = 0.5 * torch.max(vf1, vf2).mean()
                 else:
-                    vf_loss = .5 * (b.returns - value).pow(2).mean()
+                    vf_loss = 0.5 * (b.returns - value).pow(2).mean()
                 vf_losses.append(vf_loss.item())
                 e_loss = dist.entropy().mean()
                 ent_losses.append(e_loss.item())
@@ -173,13 +178,14 @@ class PPOPolicy(PGPolicy):
                 losses.append(loss.item())
                 self.optim.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(list(
-                    self.actor.parameters()) + list(self.critic.parameters()),
+                nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters())
+                    + list(self.critic.parameters()),
                     self._max_grad_norm)
                 self.optim.step()
         return {
-            'loss': losses,
-            'loss/clip': clip_losses,
-            'loss/vf': vf_losses,
-            'loss/ent': ent_losses,
+            "loss": losses,
+            "loss/clip": clip_losses,
+            "loss/vf": vf_losses,
+            "loss/ent": ent_losses,
         }

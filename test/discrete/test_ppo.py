@@ -6,15 +6,12 @@ import argparse
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.env import VectorEnv
 from tianshou.policy import PPOPolicy
+from tianshou.env import DummyVectorEnv
+from tianshou.utils.net.common import Net
 from tianshou.trainer import onpolicy_trainer
 from tianshou.data import Collector, ReplayBuffer
-
-if __name__ == '__main__':
-    from net import Net, Actor, Critic
-else:  # pytest
-    from test.discrete.net import Net, Actor, Critic
+from tianshou.utils.net.discrete import Actor, Critic
 
 
 def get_args():
@@ -57,10 +54,10 @@ def test_ppo(args=get_args()):
     args.action_shape = env.action_space.shape or env.action_space.n
     # train_envs = gym.make(args.task)
     # you can also use tianshou.env.SubprocVectorEnv
-    train_envs = VectorEnv(
+    train_envs = DummyVectorEnv(
         [lambda: gym.make(args.task) for _ in range(args.training_num)])
     # test_envs = gym.make(args.task)
-    test_envs = VectorEnv(
+    test_envs = DummyVectorEnv(
         [lambda: gym.make(args.task) for _ in range(args.test_num)])
     # seed
     np.random.seed(args.seed)
@@ -101,8 +98,8 @@ def test_ppo(args=get_args()):
     def save_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
 
-    def stop_fn(x):
-        return x >= env.spec.reward_threshold
+    def stop_fn(mean_rewards):
+        return mean_rewards >= env.spec.reward_threshold
 
     # trainer
     result = onpolicy_trainer(
@@ -111,16 +108,14 @@ def test_ppo(args=get_args()):
         args.test_num, args.batch_size, stop_fn=stop_fn, save_fn=save_fn,
         writer=writer)
     assert stop_fn(result['best_reward'])
-    train_collector.close()
-    test_collector.close()
     if __name__ == '__main__':
         pprint.pprint(result)
         # Let's watch its performance!
         env = gym.make(args.task)
+        policy.eval()
         collector = Collector(policy, env)
         result = collector.collect(n_episode=1, render=args.render)
         print(f'Final reward: {result["rew"]}, length: {result["len"]}')
-        collector.close()
 
 
 if __name__ == '__main__':
